@@ -68,12 +68,21 @@ func (s *Server) Start() {
 		mcp.WithString("cook_time", mcp.Description("The cook time for the recipe"), mcp.Required()),
 		mcp.WithString("difficulty", mcp.Description("The difficulty of the recipe"), mcp.Required()),
 	)
+	getAllRecipesTool := mcp.NewTool("get_all_paprika_recipes",
+		mcp.WithDescription("Retrieve all recipes from the Paprika 3 app. Can optionally filter by name or limit the number of results."),
+		mcp.WithString("name_filter", mcp.Description("Optional: Filter recipes by name (case-insensitive partial match)"), mcp.DefaultString("")),
+		mcp.WithNumber("limit", mcp.Description("Optional: Maximum number of recipes to return (0 = no limit)"), mcp.DefaultNumber(0)),
+		mcp.WithNumber("offset", mcp.Description("Optional: Number of recipes to skip (for pagination)"), mcp.DefaultNumber(0)),
+	)
 	s.server.AddTools(server.ServerTool{
 		Tool:    createRecipeTool,
 		Handler: s.createRecipe,
 	}, server.ServerTool{
 		Tool:    updateRecipeTool,
 		Handler: s.updateRecipe,
+	}, server.ServerTool{
+		Tool:    getAllRecipesTool,
+		Handler: s.getAllRecipes,
 	})
 
 	if err := server.ServeStdio(s.server); err != nil {
@@ -281,4 +290,143 @@ func (s *Server) updateRecipe(ctx context.Context, req mcp.CallToolRequest) (*mc
 		MIMEType: "text/markdown",
 		Text:     recipe.ToMarkdown(),
 	}), nil
+}
+
+func (s *Server) getAllRecipes(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	start := time.Now()
+
+	// Parse optional parameters
+	nameFilter := ""
+	if nf, ok := req.Params.Arguments["name_filter"].(string); ok {
+		nameFilter = nf
+	}
+
+	limit := 0
+	if l, ok := req.Params.Arguments["limit"].(float64); ok {
+		limit = int(l)
+	}
+
+	offset := 0
+	if o, ok := req.Params.Arguments["offset"].(float64); ok {
+		offset = int(o)
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	// Get the list of recipe UIDs
+	recipeList, err := s.paprika3.ListRecipes(ctx)
+	if err != nil {
+		s.logger.Error("failed to list recipes", "error", err)
+		return nil, err
+	}
+
+	s.logger.Info("Fetching all recipes", "count", len(recipeList.Result), "filter", nameFilter, "limit", limit, "offset", offset)
+
+	// Fetch all recipes concurrently
+	type recipeResult struct {
+		recipe *paprika.Recipe
+		err    error
+	}
+
+	results := make(chan recipeResult, len(recipeList.Result))
+	semaphore := make(chan struct{}, 10) // Limit concurrent requests
+
+	for _, r := range recipeList.Result {
+		go func(uid string) {
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			recipe, err := s.paprika3.GetRecipe(ctx, uid)
+			results <- recipeResult{recipe: recipe, err: err}
+		}(r.UID)
+	}
+
+	// Collect results
+	var recipes []*paprika.Recipe
+	var errorCount int
+	for i := 0; i < len(recipeList.Result); i++ {
+		result := <-results
+		if result.err != nil {
+			s.logger.Error("failed to fetch recipe", "error", result.err)
+			errorCount++
+			continue
+		}
+		if !result.recipe.InTrash {
+			recipes = append(recipes, result.recipe)
+		}
+	}
+
+	// Filter by name if specified
+	if nameFilter != "" {
+		var filtered []*paprika.Recipe
+		for _, recipe := range recipes {
+			if contains(recipe.Name, nameFilter) {
+				filtered = append(filtered, recipe)
+			}
+		}
+		recipes = filtered
+	}
+
+	// Apply offset and limit
+	totalCount := len(recipes)
+	if offset > 0 && offset < len(recipes) {
+		recipes = recipes[offset:]
+	} else if offset >= len(recipes) {
+		recipes = []*paprika.Recipe{}
+	}
+
+	if limit > 0 && limit < len(recipes) {
+		recipes = recipes[:limit]
+	}
+
+	// Build markdown output with all recipes
+	var output string
+	if nameFilter != "" {
+		output += fmt.Sprintf("# Filtered Paprika Recipes (%d of %d recipes)\n", len(recipes), totalCount)
+	} else {
+		output += fmt.Sprintf("# Paprika Recipes (%d recipes", len(recipes))
+		if offset > 0 || limit > 0 {
+			output += fmt.Sprintf(", showing %d-%d of %d", offset+1, offset+len(recipes), totalCount)
+		}
+		output += ")\n"
+	}
+	output += "\n"
+
+	for _, recipe := range recipes {
+		output += "---\n\n"
+		output += recipe.ToMarkdown()
+	}
+
+	duration := time.Since(start)
+	s.logger.Info("Retrieved recipes", "returned", len(recipes), "total", totalCount, "errors", errorCount, "duration", duration)
+
+	return mcp.NewToolResultText(output), nil
+}
+
+// contains performs a case-insensitive substring match
+func contains(s, substr string) bool {
+	s, substr = toLower(s), toLower(substr)
+	return len(s) >= len(substr) && (s == substr || indexOfSubstr(s, substr) >= 0)
+}
+
+func toLower(s string) string {
+	result := make([]rune, len(s))
+	for i, r := range s {
+		if r >= 'A' && r <= 'Z' {
+			result[i] = r + 32
+		} else {
+			result[i] = r
+		}
+	}
+	return string(result)
+}
+
+func indexOfSubstr(s, substr string) int {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return i
+		}
+	}
+	return -1
 }
