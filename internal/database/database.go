@@ -85,6 +85,7 @@ func (r *RecipeDB) createTables() error {
 
 	CREATE INDEX IF NOT EXISTS idx_recipes_name ON recipes(name);
 	CREATE INDEX IF NOT EXISTS idx_recipes_in_trash ON recipes(in_trash);
+	CREATE INDEX IF NOT EXISTS idx_recipes_rating ON recipes(rating);
 	CREATE INDEX IF NOT EXISTS idx_recipes_synced_at ON recipes(synced_at);
 
 	CREATE TABLE IF NOT EXISTS sync_metadata (
@@ -203,7 +204,7 @@ func (r *RecipeDB) GetRecipe(uid string) (*paprika.Recipe, error) {
 	return &recipe, nil
 }
 
-func (r *RecipeDB) SearchRecipes(searchQuery string, searchIn string, limit, offset int) ([]*paprika.Recipe, int, error) {
+func (r *RecipeDB) SearchRecipes(searchQuery string, searchIn string, minRating, limit, offset int) ([]*paprika.Recipe, int, error) {
 	// Build query with search filtering
 	countQuery := "SELECT COUNT(*) FROM recipes WHERE in_trash = 0"
 	query := `
@@ -238,6 +239,14 @@ func (r *RecipeDB) SearchRecipes(searchQuery string, searchIn string, limit, off
 		searchCondition := " AND (" + strings.Join(conditions, " OR ") + ")"
 		countQuery += searchCondition
 		query += searchCondition
+	}
+
+	// Add rating filter if specified
+	if minRating > 0 {
+		ratingCondition := " AND rating >= ?"
+		countQuery += ratingCondition
+		query += ratingCondition
+		args = append(args, minRating)
 	}
 
 	// Get total count

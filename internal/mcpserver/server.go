@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -89,6 +90,7 @@ func (s *Server) Start() {
 		mcp.WithDescription("Search recipes from the Paprika 3 app across all fields. Uses local database for faster access."),
 		mcp.WithString("query", mcp.Description("Search query to match against recipe fields"), mcp.DefaultString("")),
 		mcp.WithString("search_in", mcp.Description("Optional: Comma-separated list of fields to search in (name,ingredients,directions,description,notes,categories). Default searches all fields."), mcp.DefaultString("all")),
+		mcp.WithNumber("min_rating", mcp.Description("Optional: Minimum rating (1-5 stars). Only recipes with this rating or higher will be returned."), mcp.DefaultNumber(0)),
 		mcp.WithNumber("limit", mcp.Description("Optional: Maximum number of recipes to return (0 = no limit)"), mcp.DefaultNumber(0)),
 		mcp.WithNumber("offset", mcp.Description("Optional: Number of recipes to skip (for pagination)"), mcp.DefaultNumber(0)),
 		mcp.WithBoolean("force_sync", mcp.Description("Optional: Force sync from Paprika API before searching (slower but ensures latest data)"), mcp.DefaultBool(false)),
@@ -331,6 +333,11 @@ func (s *Server) searchRecipes(ctx context.Context, req mcp.CallToolRequest) (*m
 		searchIn = si
 	}
 
+	minRating := 0
+	if mr, ok := req.Params.Arguments["min_rating"].(float64); ok {
+		minRating = int(mr)
+	}
+
 	limit := 0
 	if l, ok := req.Params.Arguments["limit"].(float64); ok {
 		limit = int(l)
@@ -356,7 +363,7 @@ func (s *Server) searchRecipes(ctx context.Context, req mcp.CallToolRequest) (*m
 	}
 
 	// Search in database
-	recipes, totalCount, err := s.db.SearchRecipes(query, searchIn, limit, offset)
+	recipes, totalCount, err := s.db.SearchRecipes(query, searchIn, minRating, limit, offset)
 	if err != nil {
 		s.logger.Error("failed to search recipes in database", "error", err)
 		return nil, fmt.Errorf("failed to search recipes: %w", err)
@@ -378,6 +385,11 @@ func (s *Server) searchRecipes(ctx context.Context, req mcp.CallToolRequest) (*m
 	}
 
 	output += "\n**Source:** Local Database\n"
+
+	if minRating > 0 {
+		stars := strings.Repeat("⭐", minRating)
+		output += fmt.Sprintf("**Min Rating:** %s (%d+)\n", stars, minRating)
+	}
 
 	lastSync, _ := s.db.GetSyncMetadata("last_sync_time")
 	if lastSync != "" {
