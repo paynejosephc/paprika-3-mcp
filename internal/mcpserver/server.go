@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/soggycactus/paprika-3-mcp/internal/database"
 	"github.com/soggycactus/paprika-3-mcp/internal/paprika"
 )
 
@@ -26,9 +29,22 @@ func NewServer(opts NewServerOptions) (*Server, error) {
 		return nil, err
 	}
 
+	// Initialize local database
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user home directory: %w", err)
+	}
+	dbPath := filepath.Join(homeDir, ".paprika-3-mcp", "recipes.db")
+
+	db, err := database.NewRecipeDB(dbPath, opts.Logger)
+	if err != nil {
+		return nil, fmt.Errorf("failed to initialize database: %w", err)
+	}
+
 	s := server.NewMCPServer("paprika-3-mcp", opts.Version, server.WithResourceCapabilities(false, false))
 	return &Server{
 		paprika3: paprika3,
+		db:       db,
 		server:   s,
 		logger:   opts.Logger,
 	}, nil
@@ -36,6 +52,7 @@ func NewServer(opts NewServerOptions) (*Server, error) {
 
 type Server struct {
 	paprika3 *paprika.Client
+	db       *database.RecipeDB
 	logger   *slog.Logger
 	server   *server.MCPServer
 }
@@ -69,10 +86,14 @@ func (s *Server) Start() {
 		mcp.WithString("difficulty", mcp.Description("The difficulty of the recipe"), mcp.Required()),
 	)
 	getAllRecipesTool := mcp.NewTool("get_all_paprika_recipes",
-		mcp.WithDescription("Retrieve all recipes from the Paprika 3 app. Can optionally filter by name or limit the number of results."),
+		mcp.WithDescription("Retrieve all recipes from the Paprika 3 app. Can optionally filter by name or limit the number of results. Uses local database for faster access."),
 		mcp.WithString("name_filter", mcp.Description("Optional: Filter recipes by name (case-insensitive partial match)"), mcp.DefaultString("")),
 		mcp.WithNumber("limit", mcp.Description("Optional: Maximum number of recipes to return (0 = no limit)"), mcp.DefaultNumber(0)),
 		mcp.WithNumber("offset", mcp.Description("Optional: Number of recipes to skip (for pagination)"), mcp.DefaultNumber(0)),
+		mcp.WithBoolean("force_sync", mcp.Description("Optional: Force sync from Paprika API before retrieving (slower but ensures latest data)"), mcp.DefaultBool(false)),
+	)
+	syncRecipesTool := mcp.NewTool("sync_paprika_recipes",
+		mcp.WithDescription("Sync all recipes from Paprika 3 cloud to local database. This improves performance for future queries."),
 	)
 	s.server.AddTools(server.ServerTool{
 		Tool:    createRecipeTool,
@@ -83,6 +104,9 @@ func (s *Server) Start() {
 	}, server.ServerTool{
 		Tool:    getAllRecipesTool,
 		Handler: s.getAllRecipes,
+	}, server.ServerTool{
+		Tool:    syncRecipesTool,
+		Handler: s.syncRecipes,
 	})
 
 	if err := server.ServeStdio(s.server); err != nil {
@@ -311,8 +335,64 @@ func (s *Server) getAllRecipes(ctx context.Context, req mcp.CallToolRequest) (*m
 		offset = int(o)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	forceSync := false
+	if fs, ok := req.Params.Arguments["force_sync"].(bool); ok {
+		forceSync = fs
+	}
+
+	// If force_sync is true, sync from Paprika first
+	if forceSync {
+		s.logger.Info("Force sync requested, syncing from Paprika API")
+		if _, err := s.syncRecipes(ctx, mcp.CallToolRequest{}); err != nil {
+			s.logger.Error("failed to sync recipes", "error", err)
+			return nil, fmt.Errorf("failed to sync recipes: %w", err)
+		}
+	}
+
+	// Try to get from local database first
+	recipes, totalCount, err := s.db.GetAllRecipes(nameFilter, limit, offset)
+	if err != nil {
+		s.logger.Error("failed to get recipes from database", "error", err)
+		return nil, fmt.Errorf("failed to get recipes from database: %w", err)
+	}
+
+	// Build markdown output with all recipes
+	var output string
+	if nameFilter != "" {
+		output += fmt.Sprintf("# Filtered Paprika Recipes (%d of %d recipes)\n", len(recipes), totalCount)
+	} else {
+		output += fmt.Sprintf("# Paprika Recipes (%d recipes", len(recipes))
+		if offset > 0 || limit > 0 {
+			output += fmt.Sprintf(", showing %d-%d of %d", offset+1, offset+len(recipes), totalCount)
+		}
+		output += ")\n"
+	}
+	output += "\n**Source:** Local Database\n"
+
+	lastSync, _ := s.db.GetSyncMetadata("last_sync_time")
+	if lastSync != "" {
+		output += fmt.Sprintf("**Last Synced:** %s\n", lastSync)
+	}
+	output += "\n"
+
+	for _, recipe := range recipes {
+		output += "---\n\n"
+		output += recipe.ToMarkdown()
+	}
+
+	duration := time.Since(start)
+	s.logger.Info("Retrieved recipes from database", "returned", len(recipes), "total", totalCount, "duration", duration)
+
+	return mcp.NewToolResultText(output), nil
+}
+
+func (s *Server) syncRecipes(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	start := time.Now()
+
+	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
+
+	s.logger.Info("Starting recipe sync from Paprika API")
 
 	// Get the list of recipe UIDs
 	recipeList, err := s.paprika3.ListRecipes(ctx)
@@ -321,7 +401,7 @@ func (s *Server) getAllRecipes(ctx context.Context, req mcp.CallToolRequest) (*m
 		return nil, err
 	}
 
-	s.logger.Info("Fetching all recipes", "count", len(recipeList.Result), "filter", nameFilter, "limit", limit, "offset", offset)
+	s.logger.Info("Syncing recipes", "count", len(recipeList.Result))
 
 	// Fetch all recipes concurrently
 	type recipeResult struct {
@@ -342,8 +422,8 @@ func (s *Server) getAllRecipes(ctx context.Context, req mcp.CallToolRequest) (*m
 		}(r.UID)
 	}
 
-	// Collect results
-	var recipes []*paprika.Recipe
+	// Collect results and save to database
+	var syncedCount int
 	var errorCount int
 	for i := 0; i < len(recipeList.Result); i++ {
 		result := <-results
@@ -352,54 +432,30 @@ func (s *Server) getAllRecipes(ctx context.Context, req mcp.CallToolRequest) (*m
 			errorCount++
 			continue
 		}
-		if !result.recipe.InTrash {
-			recipes = append(recipes, result.recipe)
+
+		// Save to database
+		if err := s.db.UpsertRecipe(result.recipe); err != nil {
+			s.logger.Error("failed to save recipe to database", "error", err, "recipe", result.recipe.Name)
+			errorCount++
+			continue
 		}
+		syncedCount++
 	}
 
-	// Filter by name if specified
-	if nameFilter != "" {
-		var filtered []*paprika.Recipe
-		for _, recipe := range recipes {
-			if contains(recipe.Name, nameFilter) {
-				filtered = append(filtered, recipe)
-			}
-		}
-		recipes = filtered
-	}
-
-	// Apply offset and limit
-	totalCount := len(recipes)
-	if offset > 0 && offset < len(recipes) {
-		recipes = recipes[offset:]
-	} else if offset >= len(recipes) {
-		recipes = []*paprika.Recipe{}
-	}
-
-	if limit > 0 && limit < len(recipes) {
-		recipes = recipes[:limit]
-	}
-
-	// Build markdown output with all recipes
-	var output string
-	if nameFilter != "" {
-		output += fmt.Sprintf("# Filtered Paprika Recipes (%d of %d recipes)\n", len(recipes), totalCount)
-	} else {
-		output += fmt.Sprintf("# Paprika Recipes (%d recipes", len(recipes))
-		if offset > 0 || limit > 0 {
-			output += fmt.Sprintf(", showing %d-%d of %d", offset+1, offset+len(recipes), totalCount)
-		}
-		output += ")\n"
-	}
-	output += "\n"
-
-	for _, recipe := range recipes {
-		output += "---\n\n"
-		output += recipe.ToMarkdown()
+	// Update sync metadata
+	syncTime := time.Now().Format(time.RFC3339)
+	if err := s.db.SetSyncMetadata("last_sync_time", syncTime); err != nil {
+		s.logger.Error("failed to set sync metadata", "error", err)
 	}
 
 	duration := time.Since(start)
-	s.logger.Info("Retrieved recipes", "returned", len(recipes), "total", totalCount, "errors", errorCount, "duration", duration)
+	s.logger.Info("Sync completed", "synced", syncedCount, "errors", errorCount, "duration", duration)
+
+	output := fmt.Sprintf("# Recipe Sync Complete\n\n")
+	output += fmt.Sprintf("- **Total recipes synced:** %d\n", syncedCount)
+	output += fmt.Sprintf("- **Errors:** %d\n", errorCount)
+	output += fmt.Sprintf("- **Duration:** %s\n", duration)
+	output += fmt.Sprintf("- **Sync time:** %s\n", syncTime)
 
 	return mcp.NewToolResultText(output), nil
 }
