@@ -236,8 +236,12 @@ func (r *Recipe) ToMarkdown() string {
 		sb.WriteString(fmt.Sprintf("_%s_\n\n", r.Description))
 	}
 
-	if r.Servings != "" || r.PrepTime != "" || r.CookTime != "" || r.Difficulty != "" {
+	if r.Servings != "" || r.PrepTime != "" || r.CookTime != "" || r.Difficulty != "" || r.Rating > 0 {
 		sb.WriteString("## Details\n")
+		if r.Rating > 0 {
+			stars := strings.Repeat("⭐", r.Rating)
+			sb.WriteString(fmt.Sprintf("- **Rating:** %s (%d/5)\n", stars, r.Rating))
+		}
 		if r.Servings != "" {
 			sb.WriteString(fmt.Sprintf("- **Servings:** %s\n", r.Servings))
 		}
