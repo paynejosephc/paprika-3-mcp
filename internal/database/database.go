@@ -203,8 +203,8 @@ func (r *RecipeDB) GetRecipe(uid string) (*paprika.Recipe, error) {
 	return &recipe, nil
 }
 
-func (r *RecipeDB) GetAllRecipes(nameFilter string, limit, offset int) ([]*paprika.Recipe, int, error) {
-	// Build query with optional filtering
+func (r *RecipeDB) SearchRecipes(searchQuery string, searchIn string, limit, offset int) ([]*paprika.Recipe, int, error) {
+	// Build query with search filtering
 	countQuery := "SELECT COUNT(*) FROM recipes WHERE in_trash = 0"
 	query := `
 	SELECT uid, name, ingredients, directions, description, notes,
@@ -216,10 +216,28 @@ func (r *RecipeDB) GetAllRecipes(nameFilter string, limit, offset int) ([]*papri
 
 	args := []interface{}{}
 
-	if nameFilter != "" {
-		countQuery += " AND name LIKE ?"
-		query += " AND name LIKE ?"
-		args = append(args, "%"+nameFilter+"%")
+	if searchQuery != "" {
+		// Parse which fields to search in
+		fields := []string{}
+		if searchIn == "all" || searchIn == "" {
+			fields = []string{"name", "ingredients", "directions", "description", "notes", "categories"}
+		} else {
+			// Split comma-separated field list
+			for _, field := range strings.Split(searchIn, ",") {
+				fields = append(fields, strings.TrimSpace(field))
+			}
+		}
+
+		// Build OR conditions for each field
+		conditions := []string{}
+		for _, field := range fields {
+			conditions = append(conditions, fmt.Sprintf("%s LIKE ?", field))
+			args = append(args, "%"+searchQuery+"%")
+		}
+
+		searchCondition := " AND (" + strings.Join(conditions, " OR ") + ")"
+		countQuery += searchCondition
+		query += searchCondition
 	}
 
 	// Get total count

@@ -85,12 +85,13 @@ func (s *Server) Start() {
 		mcp.WithString("cook_time", mcp.Description("The cook time for the recipe"), mcp.Required()),
 		mcp.WithString("difficulty", mcp.Description("The difficulty of the recipe"), mcp.Required()),
 	)
-	getAllRecipesTool := mcp.NewTool("get_all_paprika_recipes",
-		mcp.WithDescription("Retrieve all recipes from the Paprika 3 app. Can optionally filter by name or limit the number of results. Uses local database for faster access."),
-		mcp.WithString("name_filter", mcp.Description("Optional: Filter recipes by name (case-insensitive partial match)"), mcp.DefaultString("")),
+	searchRecipesTool := mcp.NewTool("search_paprika_recipes",
+		mcp.WithDescription("Search recipes from the Paprika 3 app across all fields. Uses local database for faster access."),
+		mcp.WithString("query", mcp.Description("Search query to match against recipe fields"), mcp.DefaultString("")),
+		mcp.WithString("search_in", mcp.Description("Optional: Comma-separated list of fields to search in (name,ingredients,directions,description,notes,categories). Default searches all fields."), mcp.DefaultString("all")),
 		mcp.WithNumber("limit", mcp.Description("Optional: Maximum number of recipes to return (0 = no limit)"), mcp.DefaultNumber(0)),
 		mcp.WithNumber("offset", mcp.Description("Optional: Number of recipes to skip (for pagination)"), mcp.DefaultNumber(0)),
-		mcp.WithBoolean("force_sync", mcp.Description("Optional: Force sync from Paprika API before retrieving (slower but ensures latest data)"), mcp.DefaultBool(false)),
+		mcp.WithBoolean("force_sync", mcp.Description("Optional: Force sync from Paprika API before searching (slower but ensures latest data)"), mcp.DefaultBool(false)),
 	)
 	syncRecipesTool := mcp.NewTool("sync_paprika_recipes",
 		mcp.WithDescription("Sync all recipes from Paprika 3 cloud to local database. This improves performance for future queries."),
@@ -102,8 +103,8 @@ func (s *Server) Start() {
 		Tool:    updateRecipeTool,
 		Handler: s.updateRecipe,
 	}, server.ServerTool{
-		Tool:    getAllRecipesTool,
-		Handler: s.getAllRecipes,
+		Tool:    searchRecipesTool,
+		Handler: s.searchRecipes,
 	}, server.ServerTool{
 		Tool:    syncRecipesTool,
 		Handler: s.syncRecipes,
@@ -316,13 +317,18 @@ func (s *Server) updateRecipe(ctx context.Context, req mcp.CallToolRequest) (*mc
 	}), nil
 }
 
-func (s *Server) getAllRecipes(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) searchRecipes(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	start := time.Now()
 
-	// Parse optional parameters
-	nameFilter := ""
-	if nf, ok := req.Params.Arguments["name_filter"].(string); ok {
-		nameFilter = nf
+	// Parse parameters
+	query := ""
+	if q, ok := req.Params.Arguments["query"].(string); ok {
+		query = q
+	}
+
+	searchIn := "all"
+	if si, ok := req.Params.Arguments["search_in"].(string); ok {
+		searchIn = si
 	}
 
 	limit := 0
@@ -349,24 +355,28 @@ func (s *Server) getAllRecipes(ctx context.Context, req mcp.CallToolRequest) (*m
 		}
 	}
 
-	// Try to get from local database first
-	recipes, totalCount, err := s.db.GetAllRecipes(nameFilter, limit, offset)
+	// Search in database
+	recipes, totalCount, err := s.db.SearchRecipes(query, searchIn, limit, offset)
 	if err != nil {
-		s.logger.Error("failed to get recipes from database", "error", err)
-		return nil, fmt.Errorf("failed to get recipes from database: %w", err)
+		s.logger.Error("failed to search recipes in database", "error", err)
+		return nil, fmt.Errorf("failed to search recipes: %w", err)
 	}
 
-	// Build markdown output with all recipes
+	// Build markdown output
 	var output string
-	if nameFilter != "" {
-		output += fmt.Sprintf("# Filtered Paprika Recipes (%d of %d recipes)\n", len(recipes), totalCount)
+	if query != "" {
+		output += fmt.Sprintf("# Search Results for \"%s\" (%d recipes found)\n", query, totalCount)
+		if searchIn != "all" {
+			output += fmt.Sprintf("**Searched in:** %s\n", searchIn)
+		}
 	} else {
-		output += fmt.Sprintf("# Paprika Recipes (%d recipes", len(recipes))
+		output += fmt.Sprintf("# All Paprika Recipes (%d recipes", totalCount)
 		if offset > 0 || limit > 0 {
-			output += fmt.Sprintf(", showing %d-%d of %d", offset+1, offset+len(recipes), totalCount)
+			output += fmt.Sprintf(", showing %d-%d", offset+1, offset+len(recipes))
 		}
 		output += ")\n"
 	}
+
 	output += "\n**Source:** Local Database\n"
 
 	lastSync, _ := s.db.GetSyncMetadata("last_sync_time")
@@ -381,7 +391,7 @@ func (s *Server) getAllRecipes(ctx context.Context, req mcp.CallToolRequest) (*m
 	}
 
 	duration := time.Since(start)
-	s.logger.Info("Retrieved recipes from database", "returned", len(recipes), "total", totalCount, "duration", duration)
+	s.logger.Info("Searched recipes", "query", query, "fields", searchIn, "returned", len(recipes), "total", totalCount, "duration", duration)
 
 	return mcp.NewToolResultText(output), nil
 }
