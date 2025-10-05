@@ -414,7 +414,21 @@ func (s *Server) syncRecipes(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	ctx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 
-	s.logger.Info("Starting recipe sync from Paprika API")
+	s.logger.Info("Starting sync from Paprika API")
+
+	// First sync categories
+	categoryList, err := s.paprika3.ListCategories(ctx)
+	if err != nil {
+		s.logger.Error("failed to list categories", "error", err)
+		return nil, err
+	}
+
+	s.logger.Info("Syncing categories", "count", len(categoryList.Result))
+	for _, cat := range categoryList.Result {
+		if err := s.db.UpsertCategory(cat.UID, cat.Name, cat.ParentUID, cat.OrderFlag); err != nil {
+			s.logger.Error("failed to save category", "error", err, "category", cat.Name)
+		}
+	}
 
 	// Get the list of recipe UIDs
 	recipeList, err := s.paprika3.ListRecipes(ctx)

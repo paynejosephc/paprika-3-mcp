@@ -88,6 +88,16 @@ func (r *RecipeDB) createTables() error {
 	CREATE INDEX IF NOT EXISTS idx_recipes_rating ON recipes(rating);
 	CREATE INDEX IF NOT EXISTS idx_recipes_synced_at ON recipes(synced_at);
 
+	CREATE TABLE IF NOT EXISTS categories (
+		uid TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		parent_uid TEXT,
+		order_flag INTEGER,
+		synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_categories_name ON categories(name);
+
 	CREATE TABLE IF NOT EXISTS sync_metadata (
 		key TEXT PRIMARY KEY,
 		value TEXT,
@@ -192,14 +202,30 @@ func (r *RecipeDB) GetRecipe(uid string) (*paprika.Recipe, error) {
 		return nil, fmt.Errorf("failed to get recipe: %w", err)
 	}
 
-	// Convert comma-separated string back to slice
+	recipe.Created = createdAt.Format(time.RFC3339)
+
+	// Convert category UIDs to names
 	if categoriesStr != "" {
-		recipe.Categories = strings.Split(categoriesStr, ",")
+		uids := strings.Split(categoriesStr, ",")
+		categoryNames, err := r.GetCategoryNames(uids)
+		if err != nil {
+			r.logger.Error("failed to get category names", "error", err)
+			// Use UIDs as fallback
+			recipe.Categories = uids
+		} else {
+			names := make([]string, 0, len(uids))
+			for _, uid := range uids {
+				if name, found := categoryNames[uid]; found {
+					names = append(names, name)
+				} else {
+					names = append(names, uid)
+				}
+			}
+			recipe.Categories = names
+		}
 	} else {
 		recipe.Categories = []string{}
 	}
-
-	recipe.Created = createdAt.Format(time.RFC3339)
 
 	return &recipe, nil
 }
@@ -274,6 +300,9 @@ func (r *RecipeDB) SearchRecipes(searchQuery string, searchIn string, minRating,
 	defer rows.Close()
 
 	var recipes []*paprika.Recipe
+	var allCategoryUIDs []string
+	categoryUIDMap := make(map[int][]string) // recipe index -> category UIDs
+
 	for rows.Next() {
 		var recipe paprika.Recipe
 		var createdAt time.Time
@@ -300,19 +329,45 @@ func (r *RecipeDB) SearchRecipes(searchQuery string, searchIn string, minRating,
 			continue
 		}
 
-		// Convert comma-separated string back to slice
+		recipe.Created = createdAt.Format(time.RFC3339)
+
+		// Store category UIDs for later lookup
 		if categoriesStr != "" {
-			recipe.Categories = strings.Split(categoriesStr, ",")
-		} else {
-			recipe.Categories = []string{}
+			uids := strings.Split(categoriesStr, ",")
+			categoryUIDMap[len(recipes)] = uids
+			allCategoryUIDs = append(allCategoryUIDs, uids...)
 		}
 
-		recipe.Created = createdAt.Format(time.RFC3339)
 		recipes = append(recipes, &recipe)
 	}
 
 	if err = rows.Err(); err != nil {
 		return nil, 0, fmt.Errorf("error iterating recipes: %w", err)
+	}
+
+	// Batch lookup category names
+	categoryNames, err := r.GetCategoryNames(allCategoryUIDs)
+	if err != nil {
+		r.logger.Error("failed to get category names", "error", err)
+		// Continue without category names rather than failing
+	}
+
+	// Map category names back to recipes
+	for i, recipe := range recipes {
+		if uids, ok := categoryUIDMap[i]; ok {
+			names := make([]string, 0, len(uids))
+			for _, uid := range uids {
+				if name, found := categoryNames[uid]; found {
+					names = append(names, name)
+				} else {
+					// If name not found, use UID as fallback
+					names = append(names, uid)
+				}
+			}
+			recipe.Categories = names
+		} else {
+			recipe.Categories = []string{}
+		}
 	}
 
 	return recipes, totalCount, nil
@@ -325,6 +380,65 @@ func (r *RecipeDB) GetRecipeCount() (int, error) {
 		return 0, fmt.Errorf("failed to get recipe count: %w", err)
 	}
 	return count, nil
+}
+
+func (r *RecipeDB) UpsertCategory(uid, name, parentUID string, orderFlag int) error {
+	query := `
+	INSERT INTO categories (uid, name, parent_uid, order_flag, synced_at)
+	VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+	ON CONFLICT(uid) DO UPDATE SET
+		name = excluded.name,
+		parent_uid = excluded.parent_uid,
+		order_flag = excluded.order_flag,
+		synced_at = CURRENT_TIMESTAMP
+	`
+
+	_, err := r.db.Exec(query, uid, name, parentUID, orderFlag)
+	if err != nil {
+		return fmt.Errorf("failed to upsert category: %w", err)
+	}
+
+	return nil
+}
+
+func (r *RecipeDB) GetCategoryNames(uids []string) (map[string]string, error) {
+	if len(uids) == 0 {
+		return map[string]string{}, nil
+	}
+
+	// Build query with placeholders for IN clause
+	placeholders := strings.Repeat("?,", len(uids))
+	placeholders = placeholders[:len(placeholders)-1] // Remove trailing comma
+
+	query := fmt.Sprintf("SELECT uid, name FROM categories WHERE uid IN (%s)", placeholders)
+
+	// Convert []string to []interface{} for query args
+	args := make([]interface{}, len(uids))
+	for i, uid := range uids {
+		args[i] = uid
+	}
+
+	rows, err := r.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query categories: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[string]string)
+	for rows.Next() {
+		var uid, name string
+		if err := rows.Scan(&uid, &name); err != nil {
+			r.logger.Error("failed to scan category row", "error", err)
+			continue
+		}
+		result[uid] = name
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating categories: %w", err)
+	}
+
+	return result, nil
 }
 
 func (r *RecipeDB) SetSyncMetadata(key, value string) error {

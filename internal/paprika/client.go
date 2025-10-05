@@ -151,6 +151,53 @@ type RecipeList struct {
 	} `json:"result"`
 }
 
+type CategoryList struct {
+	Result []Category `json:"result"`
+}
+
+type Category struct {
+	UID        string `json:"uid"`
+	OrderFlag  int    `json:"order_flag"`
+	Name       string `json:"name"`
+	ParentUID  string `json:"parent_uid"`
+}
+
+// ListCategories retrieves a list of categories from the Paprika API
+func (c *Client) ListCategories(ctx context.Context) (*CategoryList, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://paprikaapp.com/api/v2/sync/categories", nil)
+	if err != nil {
+		c.logger.Error("failed to create request", "error", err)
+		return nil, err
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		c.logger.Error("failed to get categories", "error", err)
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.logger.Error("failed to get categories", "status", resp.Status)
+		return nil, fmt.Errorf("failed to get categories: %s", resp.Status)
+	}
+
+	rawBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.logger.Error("failed to read response body", "error", err)
+		return nil, err
+	}
+
+	var categoryList CategoryList
+	if err := json.Unmarshal(rawBytes, &categoryList); err != nil {
+		c.logger.Error("failed to unmarshal categories", "error", err)
+		return nil, err
+	}
+
+	return &categoryList, nil
+}
+
 // ListRecipes retrieves a list of recipes from the Paprika API - the response objects
 // only contain the UID and hash of each recipe, not the full recipe object
 func (c *Client) ListRecipes(ctx context.Context) (*RecipeList, error) {
@@ -236,11 +283,14 @@ func (r *Recipe) ToMarkdown() string {
 		sb.WriteString(fmt.Sprintf("_%s_\n\n", r.Description))
 	}
 
-	if r.Servings != "" || r.PrepTime != "" || r.CookTime != "" || r.Difficulty != "" || r.Rating > 0 {
+	if r.Servings != "" || r.PrepTime != "" || r.CookTime != "" || r.Difficulty != "" || r.Rating > 0 || len(r.Categories) > 0 {
 		sb.WriteString("## Details\n")
 		if r.Rating > 0 {
 			stars := strings.Repeat("⭐", r.Rating)
 			sb.WriteString(fmt.Sprintf("- **Rating:** %s (%d/5)\n", stars, r.Rating))
+		}
+		if len(r.Categories) > 0 {
+			sb.WriteString(fmt.Sprintf("- **Categories:** %s\n", strings.Join(r.Categories, ", ")))
 		}
 		if r.Servings != "" {
 			sb.WriteString(fmt.Sprintf("- **Servings:** %s\n", r.Servings))
