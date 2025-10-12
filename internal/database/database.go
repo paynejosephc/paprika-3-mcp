@@ -16,25 +16,6 @@ type RecipeDB struct {
 	logger *slog.Logger
 }
 
-type RecipeRecord struct {
-	UID         string
-	Name        string
-	Ingredients string
-	Directions  string
-	Description string
-	Notes       string
-	Servings    string
-	PrepTime    string
-	CookTime    string
-	Difficulty  string
-	Categories  string
-	Rating      int
-	InTrash     bool
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-	SyncedAt    time.Time
-}
-
 func NewRecipeDB(dbPath string, logger *slog.Logger) (*RecipeDB, error) {
 	// Open the existing Paprika database in read-only mode
 	db, err := sql.Open("sqlite", dbPath+"?mode=ro")
@@ -54,206 +35,6 @@ func NewRecipeDB(dbPath string, logger *slog.Logger) (*RecipeDB, error) {
 	}
 
 	return rdb, nil
-}
-
-func (r *RecipeDB) createTables() error {
-	schema := `
-	CREATE TABLE IF NOT EXISTS recipes (
-		uid TEXT PRIMARY KEY,
-		name TEXT NOT NULL,
-		ingredients TEXT,
-		directions TEXT,
-		description TEXT,
-		notes TEXT,
-		servings TEXT,
-		prep_time TEXT,
-		cook_time TEXT,
-		difficulty TEXT,
-		categories TEXT,
-		rating INTEGER,
-		in_trash BOOLEAN DEFAULT 0,
-		created_at TIMESTAMP,
-		updated_at TIMESTAMP,
-		synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_recipes_name ON recipes(name);
-	CREATE INDEX IF NOT EXISTS idx_recipes_in_trash ON recipes(in_trash);
-	CREATE INDEX IF NOT EXISTS idx_recipes_rating ON recipes(rating);
-	CREATE INDEX IF NOT EXISTS idx_recipes_synced_at ON recipes(synced_at);
-
-	CREATE TABLE IF NOT EXISTS categories (
-		uid TEXT PRIMARY KEY,
-		name TEXT NOT NULL,
-		parent_uid TEXT,
-		order_flag INTEGER,
-		synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_categories_name ON categories(name);
-
-	CREATE TABLE IF NOT EXISTS menu_items (
-		uid TEXT PRIMARY KEY,
-		recipe_uid TEXT,
-		name TEXT NOT NULL,
-		date TEXT NOT NULL,
-		type INTEGER,
-		order_flag INTEGER,
-		synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_menu_items_date ON menu_items(date);
-	CREATE INDEX IF NOT EXISTS idx_menu_items_recipe_uid ON menu_items(recipe_uid);
-
-	CREATE TABLE IF NOT EXISTS grocery_items (
-		uid TEXT PRIMARY KEY,
-		name TEXT NOT NULL,
-		order_flag INTEGER,
-		purchased BOOLEAN DEFAULT 0,
-		aisle TEXT,
-		aisle_uid TEXT,
-		ingredient TEXT,
-		quantity TEXT,
-		recipe TEXT,
-		recipe_uid TEXT,
-		instruction TEXT,
-		list_uid TEXT,
-		synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_grocery_items_purchased ON grocery_items(purchased);
-	CREATE INDEX IF NOT EXISTS idx_grocery_items_recipe_uid ON grocery_items(recipe_uid);
-
-	CREATE TABLE IF NOT EXISTS sync_metadata (
-		key TEXT PRIMARY KEY,
-		value TEXT,
-		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	);
-	`
-
-	_, err := r.db.Exec(schema)
-	if err != nil {
-		return fmt.Errorf("failed to create tables: %w", err)
-	}
-
-	return nil
-}
-
-func (r *RecipeDB) UpsertRecipe(recipe *paprika.Recipe) error {
-	query := `
-	INSERT INTO recipes (
-		uid, name, ingredients, directions, description, notes,
-		servings, prep_time, cook_time, difficulty, categories,
-		rating, in_trash, created_at, updated_at, synced_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-	ON CONFLICT(uid) DO UPDATE SET
-		name = excluded.name,
-		ingredients = excluded.ingredients,
-		directions = excluded.directions,
-		description = excluded.description,
-		notes = excluded.notes,
-		servings = excluded.servings,
-		prep_time = excluded.prep_time,
-		cook_time = excluded.cook_time,
-		difficulty = excluded.difficulty,
-		categories = excluded.categories,
-		rating = excluded.rating,
-		in_trash = excluded.in_trash,
-		updated_at = excluded.updated_at,
-		synced_at = CURRENT_TIMESTAMP
-	`
-
-	// Convert categories slice to comma-separated string
-	categories := strings.Join(recipe.Categories, ",")
-
-	_, err := r.db.Exec(query,
-		recipe.UID,
-		recipe.Name,
-		recipe.Ingredients,
-		recipe.Directions,
-		recipe.Description,
-		recipe.Notes,
-		recipe.Servings,
-		recipe.PrepTime,
-		recipe.CookTime,
-		recipe.Difficulty,
-		categories,
-		recipe.Rating,
-		recipe.InTrash,
-		recipe.Created,
-		recipe.Created, // Using created as both created_at and updated_at
-	)
-
-	if err != nil {
-		return fmt.Errorf("failed to upsert recipe: %w", err)
-	}
-
-	return nil
-}
-
-func (r *RecipeDB) GetRecipe(uid string) (*paprika.Recipe, error) {
-	query := `
-	SELECT uid, name, ingredients, directions, description, notes,
-		   servings, prep_time, cook_time, difficulty, categories,
-		   rating, in_trash, created_at
-	FROM recipes
-	WHERE uid = ? AND in_trash = 0
-	`
-
-	var recipe paprika.Recipe
-	var createdAt time.Time
-	var categoriesStr string
-
-	err := r.db.QueryRow(query, uid).Scan(
-		&recipe.UID,
-		&recipe.Name,
-		&recipe.Ingredients,
-		&recipe.Directions,
-		&recipe.Description,
-		&recipe.Notes,
-		&recipe.Servings,
-		&recipe.PrepTime,
-		&recipe.CookTime,
-		&recipe.Difficulty,
-		&categoriesStr,
-		&recipe.Rating,
-		&recipe.InTrash,
-		&createdAt,
-	)
-
-	if err == sql.ErrNoRows {
-		return nil, fmt.Errorf("recipe not found: %s", uid)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get recipe: %w", err)
-	}
-
-	recipe.Created = createdAt.Format(time.RFC3339)
-
-	// Convert category UIDs to names
-	if categoriesStr != "" {
-		uids := strings.Split(categoriesStr, ",")
-		categoryNames, err := r.GetCategoryNames(uids)
-		if err != nil {
-			r.logger.Error("failed to get category names", "error", err)
-			// Use UIDs as fallback
-			recipe.Categories = uids
-		} else {
-			names := make([]string, 0, len(uids))
-			for _, uid := range uids {
-				if name, found := categoryNames[uid]; found {
-					names = append(names, name)
-				} else {
-					names = append(names, uid)
-				}
-			}
-			recipe.Categories = names
-		}
-	} else {
-		recipe.Categories = []string{}
-	}
-
-	return &recipe, nil
 }
 
 func (r *RecipeDB) SearchRecipes(searchQuery string, searchIn string, minRating, limit, offset int) ([]*paprika.Recipe, int, error) {
@@ -404,25 +185,6 @@ func (r *RecipeDB) GetRecipeCount() (int, error) {
 	return count, nil
 }
 
-func (r *RecipeDB) UpsertCategory(uid, name, parentUID string, orderFlag int) error {
-	query := `
-	INSERT INTO categories (uid, name, parent_uid, order_flag, synced_at)
-	VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-	ON CONFLICT(uid) DO UPDATE SET
-		name = excluded.name,
-		parent_uid = excluded.parent_uid,
-		order_flag = excluded.order_flag,
-		synced_at = CURRENT_TIMESTAMP
-	`
-
-	_, err := r.db.Exec(query, uid, name, parentUID, orderFlag)
-	if err != nil {
-		return fmt.Errorf("failed to upsert category: %w", err)
-	}
-
-	return nil
-}
-
 func (r *RecipeDB) GetCategoryNames(uids []string) (map[string]string, error) {
 	if len(uids) == 0 {
 		return map[string]string{}, nil
@@ -515,27 +277,6 @@ func (r *RecipeDB) loadRecipeCategories(recipes []*paprika.Recipe) error {
 	return rows.Err()
 }
 
-func (r *RecipeDB) UpsertMenuItem(uid, recipeUID, name, date string, itemType, orderFlag int) error {
-	query := `
-	INSERT INTO menu_items (uid, recipe_uid, name, date, type, order_flag, synced_at)
-	VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-	ON CONFLICT(uid) DO UPDATE SET
-		recipe_uid = excluded.recipe_uid,
-		name = excluded.name,
-		date = excluded.date,
-		type = excluded.type,
-		order_flag = excluded.order_flag,
-		synced_at = CURRENT_TIMESTAMP
-	`
-
-	_, err := r.db.Exec(query, uid, recipeUID, name, date, itemType, orderFlag)
-	if err != nil {
-		return fmt.Errorf("failed to upsert menu item: %w", err)
-	}
-
-	return nil
-}
-
 func (r *RecipeDB) GetMenuItems(startDate, endDate string) ([]map[string]interface{}, error) {
 	// Use Paprika's meals table
 	query := `
@@ -585,38 +326,6 @@ func (r *RecipeDB) GetMenuItems(startDate, endDate string) ([]map[string]interfa
 	}
 
 	return items, nil
-}
-
-func (r *RecipeDB) UpsertGroceryItem(item *paprika.GroceryItem) error {
-	query := `
-	INSERT INTO grocery_items (
-		uid, name, order_flag, purchased, aisle, aisle_uid,
-		ingredient, quantity, recipe, recipe_uid, instruction, list_uid, synced_at
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-	ON CONFLICT(uid) DO UPDATE SET
-		name = excluded.name,
-		order_flag = excluded.order_flag,
-		purchased = excluded.purchased,
-		aisle = excluded.aisle,
-		aisle_uid = excluded.aisle_uid,
-		ingredient = excluded.ingredient,
-		quantity = excluded.quantity,
-		recipe = excluded.recipe,
-		recipe_uid = excluded.recipe_uid,
-		instruction = excluded.instruction,
-		list_uid = excluded.list_uid,
-		synced_at = CURRENT_TIMESTAMP
-	`
-
-	_, err := r.db.Exec(query,
-		item.UID, item.Name, item.OrderFlag, item.Purchased, item.Aisle, item.AisleUID,
-		item.Ingredient, item.Quantity, item.Recipe, item.RecipeUID, item.Instruction, item.ListUID,
-	)
-	if err != nil {
-		return fmt.Errorf("failed to upsert grocery item: %w", err)
-	}
-
-	return nil
 }
 
 func (r *RecipeDB) GetGroceryItems(purchasedOnly bool) ([]map[string]interface{}, error) {
@@ -671,34 +380,6 @@ func (r *RecipeDB) GetGroceryItems(purchasedOnly bool) ([]map[string]interface{}
 	}
 
 	return items, nil
-}
-
-func (r *RecipeDB) SetSyncMetadata(key, value string) error {
-	query := `
-	INSERT INTO sync_metadata (key, value, updated_at)
-	VALUES (?, ?, CURRENT_TIMESTAMP)
-	ON CONFLICT(key) DO UPDATE SET
-		value = excluded.value,
-		updated_at = CURRENT_TIMESTAMP
-	`
-
-	_, err := r.db.Exec(query, key, value)
-	if err != nil {
-		return fmt.Errorf("failed to set sync metadata: %w", err)
-	}
-	return nil
-}
-
-func (r *RecipeDB) GetSyncMetadata(key string) (string, error) {
-	var value string
-	err := r.db.QueryRow("SELECT value FROM sync_metadata WHERE key = ?", key).Scan(&value)
-	if err == sql.ErrNoRows {
-		return "", nil
-	}
-	if err != nil {
-		return "", fmt.Errorf("failed to get sync metadata: %w", err)
-	}
-	return value, nil
 }
 
 func (r *RecipeDB) Close() error {
