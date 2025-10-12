@@ -162,6 +162,191 @@ type Category struct {
 	ParentUID  string `json:"parent_uid"`
 }
 
+type MenuItemList struct {
+	Result []MenuItem `json:"result"`
+}
+
+type MenuItem struct {
+	UID        string `json:"uid"`
+	RecipeUID  string `json:"recipe_uid"`
+	Name       string `json:"name"`
+	Date       string `json:"date"`
+	TypeUID    string `json:"type_uid"`
+	OrderFlag  int    `json:"order_flag"`
+	Hash       string `json:"hash,omitempty"`
+}
+
+func (m *MenuItem) generateUUID() {
+	if m.UID == "" {
+		m.UID = strings.ToUpper(uuid.New().String())
+		return
+	}
+	m.UID = strings.ToUpper(m.UID)
+}
+
+func (m *MenuItem) asMap() (map[string]interface{}, error) {
+	data, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+
+	var fields map[string]interface{}
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return nil, err
+	}
+
+	return fields, nil
+}
+
+func (m *MenuItem) updateHash() error {
+	fields, err := m.asMap()
+	if err != nil {
+		return err
+	}
+
+	delete(fields, "hash")
+
+	keys := make([]string, 0, len(fields))
+	for k := range fields {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var jsonBuilder strings.Builder
+	jsonBuilder.WriteString("{")
+	for i, k := range keys {
+		if i > 0 {
+			jsonBuilder.WriteString(",")
+		}
+		jsonBuilder.WriteString(fmt.Sprintf("\"%s\":", k))
+
+		v := fields[k]
+		switch val := v.(type) {
+		case string:
+			jsonBuilder.WriteString(fmt.Sprintf("\"%s\"", val))
+		case float64:
+			jsonBuilder.WriteString(fmt.Sprintf("%v", val))
+		case bool:
+			jsonBuilder.WriteString(fmt.Sprintf("%v", val))
+		default:
+			valBytes, _ := json.Marshal(val)
+			jsonBuilder.Write(valBytes)
+		}
+	}
+	jsonBuilder.WriteString("}")
+
+	hash := sha256.Sum256([]byte(jsonBuilder.String()))
+	m.Hash = hex.EncodeToString(hash[:])
+	return nil
+}
+
+func (m *MenuItem) asGzip() ([]byte, error) {
+	data, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+
+	var buf bytes.Buffer
+	gzipWriter := gzip.NewWriter(&buf)
+	if _, err := gzipWriter.Write(data); err != nil {
+		return nil, err
+	}
+	if err := gzipWriter.Close(); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+func (c *Client) SaveMenuItem(ctx context.Context, menuItem MenuItem) (*MenuItem, error) {
+	// generate a new UUID if one doesn't exist
+	menuItem.generateUUID()
+	// generate a hash of the menu item object
+	if err := menuItem.updateHash(); err != nil {
+		return nil, err
+	}
+
+	// gzip the menu item
+	fileData, err := menuItem.asGzip()
+	if err != nil {
+		return nil, err
+	}
+
+	// Create a multipart form request
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("data", "data")
+	if err != nil {
+		c.logger.Error("failed to create form file", "error", err)
+		return nil, err
+	}
+
+	// Write the gzipped JSON data to the form file
+	if _, err := part.Write(fileData); err != nil {
+		c.logger.Error("failed to write gzipped JSON data", "error", err)
+		return nil, err
+	}
+	if err := writer.Close(); err != nil {
+		c.logger.Error("failed to close multipart writer", "error", err)
+		return nil, err
+	}
+
+	// Create the HTTP request
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("https://paprikaapp.com/api/v2/sync/menuitems/%s/", menuItem.UID), &body)
+	if err != nil {
+		c.logger.Error("failed to create request", "error", err)
+		return nil, err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.ContentLength = int64(body.Len())
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		c.logger.Error("failed to create menu item", "error", err)
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.logger.Error("failed to create menu item", "status", resp.Status)
+		return nil, fmt.Errorf("failed to create menu item: %s", resp.Status)
+	}
+
+	rawBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.logger.Error("failed to read response body", "error", err)
+		return nil, err
+	}
+
+	if err := isErrorResponse(rawBytes); err != nil {
+		c.logger.Error("failed to create menu item", "error", err)
+		return nil, err
+	}
+
+	defer c.notify(ctx)
+
+	return &menuItem, nil
+}
+
+type GroceryList struct {
+	Result []GroceryItem `json:"result"`
+}
+
+type GroceryItem struct {
+	UID          string `json:"uid"`
+	Name         string `json:"name"`
+	OrderFlag    int    `json:"order_flag"`
+	Purchased    bool   `json:"purchased"`
+	Aisle        string `json:"aisle"`
+	AisleUID     string `json:"aisle_uid"`
+	Ingredient   string `json:"ingredient"`
+	Quantity     string `json:"quantity"`
+	Recipe       string `json:"recipe"`
+	RecipeUID    string `json:"recipe_uid"`
+	Instruction  string `json:"instruction"`
+	ListUID      string `json:"list_uid"`
+}
+
 // ListCategories retrieves a list of categories from the Paprika API
 func (c *Client) ListCategories(ctx context.Context) (*CategoryList, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://paprikaapp.com/api/v2/sync/categories", nil)
@@ -196,6 +381,78 @@ func (c *Client) ListCategories(ctx context.Context) (*CategoryList, error) {
 	}
 
 	return &categoryList, nil
+}
+
+// ListMenuItems retrieves menu items (meal plan entries) from the Paprika API
+func (c *Client) ListMenuItems(ctx context.Context) (*MenuItemList, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://paprikaapp.com/api/v2/sync/menuitems", nil)
+	if err != nil {
+		c.logger.Error("failed to create request", "error", err)
+		return nil, err
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		c.logger.Error("failed to get menu items", "error", err)
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.logger.Error("failed to get menu items", "status", resp.Status)
+		return nil, fmt.Errorf("failed to get menu items: %s", resp.Status)
+	}
+
+	rawBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.logger.Error("failed to read response body", "error", err)
+		return nil, err
+	}
+
+	var menuItemList MenuItemList
+	if err := json.Unmarshal(rawBytes, &menuItemList); err != nil {
+		c.logger.Error("failed to unmarshal menu items", "error", err)
+		return nil, err
+	}
+
+	return &menuItemList, nil
+}
+
+// ListGroceryItems retrieves grocery list items from the Paprika API
+func (c *Client) ListGroceryItems(ctx context.Context) (*GroceryList, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://paprikaapp.com/api/v2/sync/groceryitems", nil)
+	if err != nil {
+		c.logger.Error("failed to create request", "error", err)
+		return nil, err
+	}
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		c.logger.Error("failed to get grocery items", "error", err)
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		c.logger.Error("failed to get grocery items", "status", resp.Status)
+		return nil, fmt.Errorf("failed to get grocery items: %s", resp.Status)
+	}
+
+	rawBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.logger.Error("failed to read response body", "error", err)
+		return nil, err
+	}
+
+	var groceryList GroceryList
+	if err := json.Unmarshal(rawBytes, &groceryList); err != nil {
+		c.logger.Error("failed to unmarshal grocery items", "error", err)
+		return nil, err
+	}
+
+	return &groceryList, nil
 }
 
 // ListRecipes retrieves a list of recipes from the Paprika API - the response objects
@@ -278,6 +535,7 @@ func (r *Recipe) ToMarkdown() string {
 	var sb strings.Builder
 
 	sb.WriteString(fmt.Sprintf("# %s\n\n", r.Name))
+	sb.WriteString(fmt.Sprintf("**UID:** `%s`\n\n", r.UID))
 
 	if r.Description != "" {
 		sb.WriteString(fmt.Sprintf("_%s_\n\n", r.Description))
