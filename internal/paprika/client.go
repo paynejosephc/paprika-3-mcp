@@ -167,13 +167,13 @@ type MenuItemList struct {
 }
 
 type MenuItem struct {
-	UID        string `json:"uid"`
-	RecipeUID  string `json:"recipe_uid"`
-	Name       string `json:"name"`
-	Date       string `json:"date"`
-	TypeUID    string `json:"type_uid"`
-	OrderFlag  int    `json:"order_flag"`
-	Hash       string `json:"hash,omitempty"`
+	UID        string  `json:"uid"`
+	RecipeUID  string  `json:"recipe_uid"`
+	Name       string  `json:"name"`
+	Date       float64 `json:"date"` // Julian date
+	TypeUID    string  `json:"type_uid"`
+	OrderFlag  int     `json:"order_flag"`
+	Hash       string  `json:"hash,omitempty"`
 }
 
 func (m *MenuItem) generateUUID() {
@@ -256,76 +256,6 @@ func (m *MenuItem) asGzip() ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
-}
-
-func (c *Client) SaveMenuItem(ctx context.Context, menuItem MenuItem) (*MenuItem, error) {
-	// generate a new UUID if one doesn't exist
-	menuItem.generateUUID()
-	// generate a hash of the menu item object
-	if err := menuItem.updateHash(); err != nil {
-		return nil, err
-	}
-
-	// gzip the menu item
-	fileData, err := menuItem.asGzip()
-	if err != nil {
-		return nil, err
-	}
-
-	// Create a multipart form request
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	part, err := writer.CreateFormFile("data", "data")
-	if err != nil {
-		c.logger.Error("failed to create form file", "error", err)
-		return nil, err
-	}
-
-	// Write the gzipped JSON data to the form file
-	if _, err := part.Write(fileData); err != nil {
-		c.logger.Error("failed to write gzipped JSON data", "error", err)
-		return nil, err
-	}
-	if err := writer.Close(); err != nil {
-		c.logger.Error("failed to close multipart writer", "error", err)
-		return nil, err
-	}
-
-	// Create the HTTP request
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("https://paprikaapp.com/api/v2/sync/menuitems/%s/", menuItem.UID), &body)
-	if err != nil {
-		c.logger.Error("failed to create request", "error", err)
-		return nil, err
-	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	req.ContentLength = int64(body.Len())
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		c.logger.Error("failed to create menu item", "error", err)
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		c.logger.Error("failed to create menu item", "status", resp.Status)
-		return nil, fmt.Errorf("failed to create menu item: %s", resp.Status)
-	}
-
-	rawBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		c.logger.Error("failed to read response body", "error", err)
-		return nil, err
-	}
-
-	if err := isErrorResponse(rawBytes); err != nil {
-		c.logger.Error("failed to create menu item", "error", err)
-		return nil, err
-	}
-
-	defer c.notify(ctx)
-
-	return &menuItem, nil
 }
 
 type GroceryList struct {

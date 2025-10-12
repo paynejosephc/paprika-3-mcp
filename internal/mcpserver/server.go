@@ -103,13 +103,6 @@ func (s *Server) Start() {
 		mcp.WithDescription("Get grocery list items from Paprika 3."),
 		mcp.WithBoolean("unpurchased_only", mcp.Description("Optional: Only show unpurchased items"), mcp.DefaultBool(true)),
 	)
-	createMenuItemTool := mcp.NewTool("create_paprika_menu_item",
-		mcp.WithDescription("Add a meal/recipe to your meal plan on a specific date"),
-		mcp.WithString("recipe_uid", mcp.Description("UID of the recipe to add to meal plan"), mcp.Required()),
-		mcp.WithString("name", mcp.Description("Name for the menu item"), mcp.Required()),
-		mcp.WithString("date", mcp.Description("Date for the meal in YYYY-MM-DD format"), mcp.Required()),
-		mcp.WithNumber("type", mcp.Description("Meal type (0=Breakfast, 1=Lunch, 2=Dinner, 3=Snack)"), mcp.DefaultNumber(2)),
-	)
 	s.server.AddTools(server.ServerTool{
 		Tool:    createRecipeTool,
 		Handler: s.createRecipe,
@@ -125,9 +118,6 @@ func (s *Server) Start() {
 	}, server.ServerTool{
 		Tool:    getGroceryListTool,
 		Handler: s.getGroceryList,
-	}, server.ServerTool{
-		Tool:    createMenuItemTool,
-		Handler: s.createMenuItem,
 	})
 
 	if err := server.ServeStdio(s.server); err != nil {
@@ -232,12 +222,12 @@ func (s *Server) createRecipe(ctx context.Context, req mcp.CallToolRequest) (*mc
 	if !ok || len(directions) == 0 {
 		return nil, errors.New("directions are required")
 	}
-	servings := req.Params.Arguments["servings"].(string)
-	prepTime := req.Params.Arguments["prep_time"].(string)
-	cookTime := req.Params.Arguments["cook_time"].(string)
-	description := req.Params.Arguments["description"].(string)
-	notes := req.Params.Arguments["notes"].(string)
-	difficulty := req.Params.Arguments["difficulty"].(string)
+	servings, _ := req.Params.Arguments["servings"].(string)
+	prepTime, _ := req.Params.Arguments["prep_time"].(string)
+	cookTime, _ := req.Params.Arguments["cook_time"].(string)
+	description, _ := req.Params.Arguments["description"].(string)
+	notes, _ := req.Params.Arguments["notes"].(string)
+	difficulty, _ := req.Params.Arguments["difficulty"].(string)
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -501,71 +491,6 @@ func (s *Server) getGroceryList(ctx context.Context, req mcp.CallToolRequest) (*
 
 	duration := time.Since(start)
 	s.logger.Info("Retrieved grocery items", "count", len(items), "duration", duration)
-
-	return mcp.NewToolResultText(output), nil
-}
-
-func (s *Server) createMenuItem(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	start := time.Now()
-
-	// Parse parameters
-	recipeUID, ok := req.Params.Arguments["recipe_uid"].(string)
-	if !ok {
-		return nil, errors.New("recipe_uid is required")
-	}
-
-	name, ok := req.Params.Arguments["name"].(string)
-	if !ok {
-		return nil, errors.New("name is required")
-	}
-
-	date, ok := req.Params.Arguments["date"].(string)
-	if !ok {
-		return nil, errors.New("date is required")
-	}
-
-	// Validate date format
-	if _, err := time.Parse("2006-01-02", date); err != nil {
-		return nil, fmt.Errorf("invalid date format (must be YYYY-MM-DD): %w", err)
-	}
-
-	mealType := 2 // Default to Dinner
-	if mt, ok := req.Params.Arguments["type"].(float64); ok {
-		mealType = int(mt)
-	}
-
-	// Map meal type to UID
-	mealTypeUIDs := []string{
-		"913D33C7FD39DB8C8C4514669B011F617D911345592CC77B309B812667959720", // 0: Breakfast
-		"74B7DE10D8791D7B501CB5DC41365994F2CC80227B7CE5CB2548E24AF26DC939", // 1: Lunch
-		"216713D08860CFA0D9787EA5C6CEBC8A8F5B73777F91C904853AC234BB9DF642", // 2: Dinner
-		"CAE5ADDAAB3EAE7D474EC14086EB0429CAE123F3E5865BDF4879183A7D444BE1", // 3: Snacks
-	}
-
-	if mealType < 0 || mealType > 3 {
-		return nil, errors.New("type must be between 0 and 3 (0=Breakfast, 1=Lunch, 2=Dinner, 3=Snacks)")
-	}
-
-	// Create menu item
-	menuItem := paprika.MenuItem{
-		RecipeUID: recipeUID,
-		Name:      name,
-		Date:      date,
-		TypeUID:   mealTypeUIDs[mealType],
-		OrderFlag: 0,
-	}
-
-	savedMenuItem, err := s.paprika3.SaveMenuItem(ctx, menuItem)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create menu item: %w", err)
-	}
-
-	duration := time.Since(start)
-	s.logger.Info("Created menu item", "uid", savedMenuItem.UID, "name", name, "date", date, "duration", duration)
-
-	mealTypeStr := []string{"Breakfast", "Lunch", "Dinner", "Snacks"}[mealType]
-	output := fmt.Sprintf("# Menu Item Created\n\n**Name:** %s\n**UID:** `%s`\n**Date:** %s\n**Type:** %s\n**Recipe UID:** `%s`\n",
-		savedMenuItem.Name, savedMenuItem.UID, savedMenuItem.Date, mealTypeStr, savedMenuItem.RecipeUID)
 
 	return mcp.NewToolResultText(output), nil
 }
